@@ -9,6 +9,7 @@ project(UKF_Odom)
 ## is used, also find other catkin packages
 find_package(catkin REQUIRED COMPONENTS
   geometry_msgs
+  std_msgs
   rospy
   gazebo_msgs
   sensor_msgs

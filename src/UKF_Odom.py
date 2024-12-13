@@ -5,6 +5,7 @@ from nav_msgs.msg import Odometry
 from geometry_msgs.msg import PoseStamped, TwistStamped, Twist, Point, Quaternion
 from gazebo_msgs.msg import LinkStates
 from sensor_msgs.msg import Imu, JointState
+from std_msgs.msg import Float64
 import math
 import numpy as np
 from message_filters import ApproximateTimeSynchronizer, Subscriber
@@ -16,16 +17,22 @@ class UKF_Odometry:
 
         self.ukf_odom_pub = rospy.Publisher('/ukf_odom', Odometry, queue_size=10)
         self.ekf_odom_pub = rospy.Publisher('/ekf_odom', Odometry, queue_size=10)
+        self.ukf_error_pub = rospy.Publisher('/ukf_error', Float64, queue_size=10)
+        self.ekf_error_pub = rospy.Publisher('/ekf_error', Float64, queue_size=10)
 
         # Subscribers for topics
         imu_sub = Subscriber('/imu_sim', Imu)
         wheel_encoder_sub = Subscriber('/wheel_encoder_sim', JointState)
         cmd_vel_sub = Subscriber('/mobile_base_controller/cmd_vel', Twist)
-        #gt_pose_sub = Subscriber('/omni')
+        gt_pose_sub = Subscriber('/omni/ground_truth/pose', PoseStamped)
+        gt_twist_sub = Subscriber('/omni/ground_truth/twist', TwistStamped)
 
         # Synchronize the topics
-        self.ats = ApproximateTimeSynchronizer([imu_sub, wheel_encoder_sub, cmd_vel_sub], queue_size=100, slop=5.0, allow_headerless=True)
-        self.ats.registerCallback(self.callback)
+        self.filter_sync = ApproximateTimeSynchronizer([imu_sub, wheel_encoder_sub, cmd_vel_sub], queue_size=10, slop=5, allow_headerless=True)
+        self.filter_sync.registerCallback(self.filter_callback)
+
+        self.gt_sync = ApproximateTimeSynchronizer([gt_pose_sub, gt_twist_sub], queue_size=10, slop=1.5, allow_headerless=True)
+        self.gt_sync.registerCallback(self.error_callback)
 
         rospy.loginfo("Subscribers created and callback registered.")
 
@@ -39,7 +46,26 @@ class UKF_Odometry:
 
         self.prev_time = None
 
-    def callback(self, imu_data, wheel_encoder_data, cmd_vel):
+    def error_callback(self, gt_pose, gt_twist):
+
+        x_gt = gt_pose.pose.position.x
+        y_gt = gt_pose.pose.position.y
+        
+        ukf_position_error = math.sqrt((self.ukf_state[0]-x_gt)**2 + (self.ukf_state[1] - y_gt)**2)
+        ekf_position_error = math.sqrt((self.ekf_state[0]-x_gt)**2 + (self.ekf_state[1] - y_gt)**2)
+
+        ukf_error = Float64()
+        ekf_error = Float64()
+
+        ukf_error.data = ukf_position_error
+        ekf_error.data = ekf_position_error
+
+        self.ukf_error_pub.publish(ukf_position_error)
+        self.ekf_error_pub.publish(ekf_position_error)
+        
+
+
+    def filter_callback(self, imu_data, wheel_encoder_data, cmd_vel):
         #rospy.loginfo("entering callback")
         current_t = imu_data.header.stamp
         current_t_sec = current_t.to_sec()
@@ -108,12 +134,6 @@ class UKF_Odometry:
         UKF_posterior, UKF_cov_posterior = self.innovation(pred_state, pred_cov, measurement, z_cov)
         EKF_posterior, EKF_cov_posterior = self.innovation(EKF_pred.reshape(6), EKF_pred_cov, measurement, z_cov)
 
-        #rospy.loginfo(np.shape(pred_cov))
-        
-        #rospy.loginfo(np.shape(EKF_pred_cov))
-
-        #rospy.loginfo(EKF_posterior)
-
         self.ekf_state = EKF_posterior
         self.ekf_state_cov = EKF_cov_posterior
 
@@ -132,6 +152,7 @@ class UKF_Odometry:
         vy = cmd_vel.linear.y
         omega = cmd_vel.angular.z
 
+
         #Jacobian to use EKF in order to compare
         Gx = np.array([[1, 0, -(vx*np.sin(state[2]) + vy*np.cos(state[2]))*dt, dt*np.cos(state[2]), -dt*np.sin(state[2]), 0],
                        [0, 1, (vx*np.cos(state[2]) - vy*np.sin(state[2]))*dt, dt*np.sin(state[2]), dt*np.cos(state[2]), 0],
@@ -141,15 +162,25 @@ class UKF_Odometry:
                        [0, 0, 0, 0, 0, 1]])
 
         #implement nonlinear motion model for prediction
-        predicted_state = np.zeros((6,1))
-        predicted_state[0] = state[0] + (vx*np.cos(state[2]) - vy*np.sin(state[2]))*dt
-        predicted_state[1] = state[1] + (vy*np.cos(state[2]) + vx*np.sin(state[2]))*dt
-        predicted_state[2] = state[2] + omega*dt
-        predicted_state[3] = vx
-        predicted_state[4] = vy
-        predicted_state[5] = omega
+        A = np.zeros((6,1))
+        A[0] = state[0] + (vx*np.cos(state[2]) - vy*np.sin(state[2]))*dt
+        A[1] = state[1] + (vy*np.cos(state[2]) + vx*np.sin(state[2]))*dt
+        A[2] = state[2] + omega*dt
+        A[3] = 0
+        A[4] = 0
+        A[5] = 0
+
+        #input is linear
+        B_u = np.zeros((6,1))
+        B_u[5] = omega
+        B_u[4] = vy
+        B_u[3] = vx
+
+        predicted_state = A + B_u
+        #No input covariance due to the way 
 
         EKF_pred_cov = Gx@self.ekf_state_cov@Gx.T
+
 
         return predicted_state, EKF_pred_cov
 
