@@ -2,18 +2,19 @@
 
 import rospy
 from nav_msgs.msg import Odometry
-from geometry_msgs.msg import PoseStamped, TwistStamped, Twist
+from geometry_msgs.msg import PoseStamped, TwistStamped, Twist, Point, Quaternion
 from gazebo_msgs.msg import LinkStates
 from sensor_msgs.msg import Imu, JointState
 import math
 import numpy as np
 from message_filters import ApproximateTimeSynchronizer, Subscriber
+from tf import transformations
 
 class UKF_Odometry:
     def __init__(self):
         rospy.loginfo("Initializing node...")
 
-        self.odom_pub = rospy.Publisher('/UKF_odom', Odometry, queue_size=10)
+        self.odom_pub = rospy.Publisher('/ukf_odom', Odometry, queue_size=10)
 
         # Subscribers for topics
         imu_sub = Subscriber('/imu_sim', Imu)
@@ -34,7 +35,7 @@ class UKF_Odometry:
         self.prev_time = None
 
     def callback(self, imu_data, wheel_encoder_data, cmd_vel):
-        rospy.loginfo("entering callback")
+        #rospy.loginfo("entering callback")
         current_t = imu_data.header.stamp
         current_t_sec = current_t.to_sec()
         if self.prev_time is None:
@@ -50,7 +51,7 @@ class UKF_Odometry:
         z_cov = 3*np.eye(5)
         z_cov[0,0] = imu_data.angular_velocity_covariance[8]
 
-        #Compute EKF in order to compare and show the difference in complexity between EKF and UKF
+        #find EKF prediction and Predicted covariance to compare with UKF
         EKF_pred, EKF_pred_cov = self.predict(self.state, cmd_vel, dt)
 
         #define dimension of state for use in UKF
@@ -65,7 +66,7 @@ class UKF_Odometry:
         #need to define the sigma points that will be used to reconstuct predicted mean and covariance
         sigma = np.zeros((2*n+1, n))        
         cov_sqrt = np.linalg.cholesky(self.state_cov)
-        rospy.loginfo(EKF_pred_cov)
+        #rospy.loginfo(EKF_pred_cov)
 
         #first sigma point is just the current state
         sigma[0] = self.state.T
@@ -81,23 +82,15 @@ class UKF_Odometry:
         
         mean_weights[0] = lambda_value/(lambda_value+n)
         cov_weights[0] = lambda_value/(lambda_value+n)
-        #rospy.loginfo(mean_weights)
-        #rospy.loginfo(cov_weights)
         weighted_pred = np.zeros((2*n+1, n))
         weighted_cov_pred = []
 
-
+        mean_pred, _ = self.predict(self.state, cmd_vel, dt)
 
         for i in range(len(sigma)):
             pred, _ = self.predict(sigma[i], cmd_vel, dt)
-            #rospy.loginfo(pred)
-            weighted_pred[i] = (mean_weights[i]*pred).T
-
-        for i in range(len(sigma)):
-            distance = sigma[i]-weighted_pred[i]
-            #rospy.loginfo(np.shape(distanceT))
-            #A = distanceT@distance
-            #rospy.loginfo(distance)
+            weighted_pred[i] = (mean_weights[i]*pred).T       
+            distance = mean_pred-pred
             A = np.outer(distance, distance)
             weighted_cov_pred.append(cov_weights[i]*A)
 
@@ -107,16 +100,19 @@ class UKF_Odometry:
             pred_cov += matrix
         
         pred_state = np.sum(weighted_pred, axis=0)
+        UKF_posterior, UKF_cov_posterior = self.innovation(pred_state, pred_cov, measurement, z_cov)
+        #EKF_posterior, EKF_cov_posterior = self.innovation(EKF_pred.T, EKF_pred_cov, measurement, z_cov)
+
         #rospy.loginfo(pred_state)
-        #self.state = pred_state
-        #self.cov = pred_cov
-        #rospy.loginfo(pred_cov)
-        #rospy.loginfo(measurement)
-        self.innovation(pred_state, pred_cov, measurement, z_cov)
-        rospy.loginfo(self.state)
-        #rospy.loginfo(self.state_cov)
+        #rospy.loginfo(EKF_pred)
 
+        #rospy.loginfo(EKF_posterior)
 
+        self.state = UKF_posterior
+        self.state_cov = UKF_cov_posterior
+        #rospy.loginfo(self.state)
+
+        self.publish_odometry(current_t)
         
 
     def predict(self, state, cmd_vel, dt):
@@ -175,8 +171,47 @@ class UKF_Odometry:
         innovation_cov = C@pred_cov@(C.T) + z_cov + epsilon*np.eye(5)
         innovation_cov = np.array(innovation_cov, dtype=np.float64)
         K = pred_cov@(C.T)@np.linalg.inv(innovation_cov)
-        self.state = pred_state + K@(z - C@pred_state)
-        self.state_cov = (np.eye(6) - K@C)@pred_cov + epsilon*np.eye(6)
+        state = pred_state + K@(z - C@pred_state)
+        state_cov = (np.eye(6) - K@C)@pred_cov + epsilon*np.eye(6)
+        return state, state_cov
+    
+    def publish_odometry(self, current_t):
+        message = Odometry()
+        orientation_matrix = np.array([[np.cos(self.state[2]), -np.sin(self.state[2]), 0, 0],
+                                      [np.sin(self.state[2]), np.cos(self.state[2]), 0, 0],
+                                      [0, 0, 1, 0], [ 0, 0, 0, 1]])
+
+        message.header.stamp = current_t
+        message.header.frame_id = "odom"
+        message.child_frame_id = "base_footprint"
+
+        message.pose.pose.position = Point(self.state[0], self.state[1], 0)        
+        message.pose.pose.orientation = Quaternion(*transformations.quaternion_from_matrix(orientation_matrix))
+
+        pose_cov = np.zeros((6,6))
+        pose_cov[0, 0] = self.state_cov[0,0]
+        pose_cov[0,1], pose_cov[1, 0] = self.state_cov[0,1], self.state_cov[0,1]
+        pose_cov[1,1] = self.state_cov[1, 1]
+        pose_cov[0, -1], pose_cov[-1, 0] = self.state_cov[0, 2], self.state_cov[0, 2]
+        pose_cov[1, -1], pose_cov[-1 ,1] = self.state_cov[1, 2], self.state_cov[1, 2]
+        pose_cov[-1, -1] = self.state_cov[2, 2]
+
+        message.pose.covariance = pose_cov.flatten().tolist()
+
+        message.twist.twist.linear.x = self.state[3]
+        message.twist.twist.linear.y = self.state[4]
+        message.twist.twist.angular.z = self.state[5]
+
+        twist_cov = np.zeros((6,6))
+        twist_cov[0, 0] = self.state_cov[3, 3]
+        twist_cov[1, 1] = self.state_cov[4, 4]
+        twist_cov[-1, -1] = self.state_cov[5, 5]
+        twist_cov[0, -1], twist_cov[-1, 0] = self.state_cov[-1, 3], self.state_cov[-1, 3]
+        twist_cov[1, -1], twist_cov[-1, 1] = self.state_cov[4, -1], self.state_cov[-1, 4]
+
+        message.twist.covariance = twist_cov.flatten().tolist()
+
+        self.odom_pub.publish(message)
         
 
 
