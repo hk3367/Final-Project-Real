@@ -79,7 +79,7 @@ class UKF_Odometry:
         measurement = np.zeros(5).T
         measurement[1:] = wheel_encoder_data.velocity
         measurement[0] = imu_data.angular_velocity.z
-        z_cov = 3*np.eye(5)
+        z_cov = 1.5*np.eye(5)
         z_cov[0,0] = imu_data.angular_velocity_covariance[8]
 
         #find EKF prediction and Predicted covariance to compare with UKF
@@ -209,13 +209,13 @@ class UKF_Odometry:
         C[1,5] = -1*C[1,5]
         C[3,5] = -1*C[3,5]
 
-        epsilon = 1e-6
+        
 
-        innovation_cov = C@pred_cov@(C.T) + z_cov + epsilon*np.eye(5)
+        innovation_cov = C@pred_cov@(C.T) + z_cov
         innovation_cov = np.array(innovation_cov, dtype=np.float64)
         K = pred_cov@(C.T)@np.linalg.inv(innovation_cov)
         state = pred_state + K@(z - C@pred_state)
-        state_cov = (np.eye(6) - K@C)@pred_cov + epsilon*np.eye(6)
+        state_cov = (np.eye(6) - K@C)@pred_cov
         return state, state_cov
     
     def odometry_message(self, current_t, state, state_cov):
